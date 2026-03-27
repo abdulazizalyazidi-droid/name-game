@@ -682,6 +682,14 @@ function renderPlaying(app) {
   document.querySelectorAll(".cat-input").forEach(inp => {
     inp.addEventListener("input", e => {
       state.answers[e.target.dataset.key] = e.target.value;
+      // Update button text
+      const filled = CATS.filter(c => (state.answers[c.key] || "").trim()).length;
+      const btn = document.getElementById("btn-finish");
+      if (btn) {
+        btn.disabled = filled === 0;
+        btn.className = "btn " + (filled === 5 ? "btn-green" : "btn-yellow");
+        btn.textContent = filled === 5 ? "خلصت! 🏁" : "خلصت (" + filled + "/5) ⚡";
+      }
     });
   });
 
