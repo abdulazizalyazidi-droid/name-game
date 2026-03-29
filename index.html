@@ -363,7 +363,11 @@ function validateAnswersLocal(letter, answers) {
   const result = {};
   CATS.forEach(c => {
     const ans = (answers[c.key] || "").trim();
-    result[c.key] = ans.length > 0 && startsWithLetter(ans, letter);
+    // Must be 2+ chars, start with the letter, and not be gibberish (all same char)
+    const isLongEnough = ans.length >= 2;
+    const startsRight = startsWithLetter(ans, letter);
+    const isGibberish = ans.length > 0 && new Set(ans.replace(/\s/g,'')).size <= 1;
+    result[c.key] = isLongEnough && startsRight && !isGibberish;
   });
   return result;
 }
@@ -430,14 +434,16 @@ async function validateWithAI(letter, allPlayersAnswers) {
 
 القواعد:
 1. الإجابة لازم تبدأ بالحرف "${letterDisplay}"
-2. الإجابة لازم تكون صحيحة وموجودة فعلاً (اسم حقيقي، حيوان حقيقي، نبات حقيقي، الخ)
-3. "اسم" = اسم إنسان حقيقي (مش لقب أو كنية)
-4. "جماد" = شيء غير حي وغير نبات
-5. "حيوان" = حيوان حقيقي موجود
-6. "نبات" = نبات حقيقي موجود
-7. "بلاد" = دولة أو مدينة حقيقية موجودة
-8. حرف الألف بكل أشكاله (أ، إ، آ، ا) يعتبر نفس الحرف
-9. حرف الهاء (ه) وهـ يعتبر نفس الحرف
+2. الإجابة لازم تكون كلمة حقيقية موجودة فعلاً وليست حروف عشوائية أو كلام فاضي
+3. إذا الإجابة حرف واحد أو حروف مكررة أو كلام ما له معنى = false
+4. "اسم" = اسم إنسان عربي أو أجنبي حقيقي معروف (مش لقب أو كنية أو كلمة عشوائية)
+5. "جماد" = شيء غير حي وغير نبات حقيقي موجود
+6. "حيوان" = حيوان حقيقي موجود ومعروف
+7. "نبات" = نبات حقيقي موجود ومعروف
+8. "بلاد" = دولة أو مدينة حقيقية موجودة على الخريطة
+9. حرف الألف بكل أشكاله (أ، إ، آ، ا) يعتبر نفس الحرف
+10. حرف الهاء (ه) وهـ يعتبر نفس الحرف
+11. كن صارم! لا تقبل إلا الإجابات الحقيقية المعروفة
 
 قيّم الإجابات التالية وارجع النتيجة بصيغة JSON فقط بدون أي نص إضافي:
 
@@ -526,6 +532,7 @@ async function createRoom() {
   state.isHost = true;
   state.screen = "lobby";
   state.error = "";
+  saveSession();
   render();
   listenToRoom(code);
 }
@@ -550,6 +557,7 @@ async function joinRoom() {
   state.isHost = false;
   state.screen = "lobby";
   state.error = "";
+  saveSession();
   render();
   listenToRoom(code);
 }
@@ -609,6 +617,11 @@ function listenToRoom(code) {
       state.locked = false;
       state.answers = {};
       state.results = null;
+    }
+
+    // Skip re-render if player is actively typing (playing & not locked & no status change)
+    if (state.screen === "playing" && !state.locked && room.status === "playing" && prevStatus === "playing") {
+      return;
     }
 
     render();
@@ -888,13 +901,82 @@ function renderGameOver(app) {
   }
 }
 
-// ═══ Render ═══
+// ═══ Session Persistence ═══
+function saveSession() {
+  try {
+    localStorage.setItem("game_session", JSON.stringify({
+      myName: state.myName,
+      roomCode: state.roomCode,
+      isHost: state.isHost,
+      maxRounds: state.maxRounds,
+    }));
+  } catch(e) {}
+}
+
+function restoreSession() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("game_session"));
+    if (saved && saved.roomCode) {
+      state.myName = saved.myName || "";
+      state.roomCode = saved.roomCode || "";
+      state.isHost = saved.isHost || false;
+      state.maxRounds = saved.maxRounds || 10;
+      // Try to rejoin the room
+      roomRef(saved.roomCode).once("value").then(snap => {
+        if (snap.exists()) {
+          const room = snap.val();
+          // Check if player still exists in room
+          if (room.players && room.players[saved.myName]) {
+            state.isHost = room.host === saved.myName;
+            if (room.status === "lobby") state.screen = "lobby";
+            else if (room.status === "playing" || room.status === "stopped") {
+              state.screen = "playing";
+              state.locked = room.status === "stopped";
+            }
+            else if (room.status === "results") {
+              buildResults(room);
+              state.screen = "results";
+            }
+            else if (room.status === "gameover") state.screen = "gameover";
+            state.room = room;
+            render();
+            listenToRoom(saved.roomCode);
+          } else {
+            clearSession();
+            render();
+          }
+        } else {
+          clearSession();
+          render();
+        }
+      });
+      return true;
+    }
+  } catch(e) {}
+  return false;
+}
+
+function clearSession() {
+  try { localStorage.removeItem("game_session"); } catch(e) {}
+  state.screen = "home";
+  state.roomCode = "";
+  state.isHost = false;
+  state.room = null;
+}
+
+// ═══ Render (with flicker fix) ═══
+let lastScreen = "";
 function render() {
   const app = document.getElementById("app");
-  app.innerHTML = "";
-  app.style.animation = "none";
-  void app.offsetWidth;
-  app.style.animation = "fadeIn .4s ease-out";
+  const screenChanged = lastScreen !== state.screen;
+  lastScreen = state.screen;
+
+  if (screenChanged) {
+    app.innerHTML = "";
+    app.style.animation = "none";
+    void app.offsetWidth;
+    app.style.animation = "fadeIn .4s ease-out";
+  }
 
   switch(state.screen) {
     case "home": renderHome(app); break;
@@ -1234,7 +1316,9 @@ function getEffectiveTotal(data, overrides, room) {
 }
 
 // ═══ Start ═══
-render();
+if (!restoreSession()) {
+  render();
+}
 </script>
 </body>
 </html>
