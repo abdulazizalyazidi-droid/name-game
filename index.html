@@ -329,6 +329,7 @@ let state = {
   aiValidating: false,
   results: null,
   error: "",
+  maxRounds: 10,
   hostOverrides: {},  // { playerName: { catKey: true/false } }
   scoresDirty: false,
 };
@@ -365,6 +366,58 @@ function validateAnswersLocal(letter, answers) {
     result[c.key] = ans.length > 0 && startsWithLetter(ans, letter);
   });
   return result;
+}
+
+// ═══ Duplicate Detection ═══
+function normalizeAnswer(str) {
+  if (!str) return "";
+  return str.trim().replace(/\s+/g, " ").replace(/[أإآا]/g, "ا").replace(/ة/g, "ه").replace(/ى/g, "ي").toLowerCase();
+}
+
+function findDuplicates(allPlayersValidation, allPlayersAnswers) {
+  // Returns { playerName: { catKey: "unique"|"duplicate"|"wrong"|"empty" } }
+  const result = {};
+  const playerNames = Object.keys(allPlayersAnswers);
+
+  for (const name of playerNames) {
+    result[name] = {};
+  }
+
+  CATS.forEach(c => {
+    // Collect valid answers per player
+    const validAnswers = {};
+    for (const name of playerNames) {
+      const ans = (allPlayersAnswers[name]?.[c.key] || "").trim();
+      const isValid = allPlayersValidation[name]?.[c.key];
+      if (!ans) {
+        result[name][c.key] = "empty";
+      } else if (!isValid) {
+        result[name][c.key] = "wrong";
+      } else {
+        validAnswers[name] = normalizeAnswer(ans);
+      }
+    }
+
+    // Check for duplicates among valid answers
+    const namesWithValid = Object.keys(validAnswers);
+    for (const name of namesWithValid) {
+      const myNorm = validAnswers[name];
+      const isDuplicate = namesWithValid.some(other => other !== name && validAnswers[other] === myNorm);
+      result[name][c.key] = isDuplicate ? "duplicate" : "unique";
+    }
+  });
+
+  return result;
+}
+
+function calcScoreFromDuplicates(name, dupInfo, finisher) {
+  let score = 0;
+  CATS.forEach(c => {
+    const status = dupInfo[name]?.[c.key];
+    if (status === "unique") score += 10;
+    else if (status === "duplicate") score += 5;
+  });
+  return score;
 }
 
 // ═══ AI Validation ═══
@@ -456,11 +509,13 @@ async function createRoom() {
   if (!state.myName.trim()) { state.error = "ادخل اسمك أول!"; render(); return; }
   const code = genCode();
   const name = state.myName.trim();
+  const maxRounds = state.maxRounds || 10;
   const roomData = {
     host: name,
     status: "lobby",
     letter: "",
     round: 0,
+    maxRounds: maxRounds,
     finisher: "",
   };
 
@@ -545,6 +600,17 @@ function listenToRoom(code) {
       state.scoresDirty = false;
     }
 
+    if (room.status === "gameover" && state.screen !== "gameover") {
+      state.screen = "gameover";
+    }
+
+    if (room.status === "lobby" && prevStatus === "gameover") {
+      state.screen = "lobby";
+      state.locked = false;
+      state.answers = {};
+      state.results = null;
+    }
+
     render();
   });
 }
@@ -560,6 +626,7 @@ async function startGame() {
       answers: null,
       validation: null,
       aiValidation: null,
+      dupInfo: null,
       submitted: false,
       roundScore: 0,
     });
@@ -629,35 +696,31 @@ async function calculateScores() {
   state.aiValidating = false;
   render();
 
+  // First pass: set validation
+  const allValidation = {};
+  const allAnswers = {};
   for (const [name, pData] of Object.entries(players)) {
     const answers = pData.answers || {};
-    // Use AI validation if available, otherwise fall back to local
-    let validation;
+    allAnswers[name] = answers;
     if (aiResults && aiResults[name]) {
-      validation = aiResults[name];
+      allValidation[name] = aiResults[name];
     } else {
-      validation = pData.validation || validateAnswersLocal(letter, answers);
+      allValidation[name] = pData.validation || validateAnswersLocal(letter, answers);
     }
+  }
 
-    let correct = 0, wrong = 0;
-    CATS.forEach(c => {
-      const ans = (answers[c.key] || "").trim();
-      if (!ans) return;
-      if (validation[c.key]) correct++;
-      else wrong++;
-    });
+  // Detect duplicates
+  const dupInfo = findDuplicates(allValidation, allAnswers);
 
-    let roundScore = correct * 10;
-    if (name === finisher) {
-      if (wrong > 0) roundScore -= (wrong * 5);
-      if (wrong === 0 && correct === 5) roundScore += 5;
-    }
-
+  for (const [name, pData] of Object.entries(players)) {
+    const validation = allValidation[name];
+    const roundScore = calcScoreFromDuplicates(name, dupInfo, finisher);
     const totalScore = (pData.totalScore || 0) + roundScore;
 
     await roomRef(code).child("players/" + name).update({
       validation: validation,
       aiValidation: aiResults ? (aiResults[name] || null) : null,
+      dupInfo: dupInfo[name] || {},
       roundScore: roundScore,
       totalScore: totalScore,
     });
@@ -675,6 +738,7 @@ function buildResults(room) {
       answers: pData.answers || {},
       validation: pData.validation || {},
       aiValidation: pData.aiValidation || null,
+      dupInfo: pData.dupInfo || {},
       roundScore: pData.roundScore || 0,
       totalScore: pData.totalScore || 0,
     };
@@ -705,30 +769,22 @@ async function applyHostOverrides() {
   const finisher = room.finisher;
   const players = room.players || {};
 
+  // Recalculate with overrides as validation
+  const allAnswersForDup = {};
+  for (const [name, pData] of Object.entries(players)) {
+    allAnswersForDup[name] = pData.answers || {};
+  }
+  const dupInfo = findDuplicates(state.hostOverrides, allAnswersForDup);
+
   for (const [name, overrides] of Object.entries(state.hostOverrides)) {
     const pData = players[name] || {};
-    const answers = pData.answers || {};
-
-    let correct = 0, wrong = 0;
-    CATS.forEach(c => {
-      const ans = (answers[c.key] || "").trim();
-      if (!ans) return;
-      if (overrides[c.key]) correct++;
-      else wrong++;
-    });
-
-    let roundScore = correct * 10;
-    if (name === finisher) {
-      if (wrong > 0) roundScore -= (wrong * 5);
-      if (wrong === 0 && correct === 5) roundScore += 5;
-    }
-
-    // Recalculate total: previous total - old round score + new round score
+    const roundScore = calcScoreFromDuplicates(name, dupInfo, finisher);
     const oldRoundScore = pData.roundScore || 0;
     const totalScore = (pData.totalScore || 0) - oldRoundScore + roundScore;
 
     await roomRef(code).child("players/" + name).update({
       validation: overrides,
+      dupInfo: dupInfo[name] || {},
       roundScore: roundScore,
       totalScore: totalScore,
     });
@@ -752,6 +808,88 @@ async function nextRound() {
   await startGame();
 }
 
+async function showGameOver() {
+  const code = state.roomCode;
+  await roomRef(code).update({ status: "gameover" });
+}
+
+function renderGameOver(app) {
+  const room = state.room || {};
+  const players = room.players || {};
+  const sorted = Object.entries(players)
+    .map(([name, p]) => ({ name, totalScore: p.totalScore || 0 }))
+    .sort((a, b) => b.totalScore - a.totalScore);
+  const medals = ["🥇","🥈","🥉"];
+  const trophies = ["👑","⭐","🎖️"];
+
+  app.innerHTML = `
+    <div class="center" style="margin:20px 0 28px;">
+      <div style="font-size:4rem; margin-bottom:8px; animation:pop .6s ease-out;">🏆</div>
+      <h1 style="font-size:1.6rem; font-weight:900;
+        background:linear-gradient(135deg, var(--yellow), var(--accent));
+        -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
+        النتائج النهائية
+      </h1>
+      <p style="color:var(--dim); font-size:.85rem; margin-top:6px;">
+        ${room.maxRounds || "?"} جولات
+      </p>
+    </div>
+
+    ${sorted.map((p, idx) => `
+      <div class="result-card ${idx === 0 ? 'first' : ''}" style="animation-delay:${idx * .15}s;
+        ${idx === 0 ? 'border: 2px solid var(--yellow); background: rgba(255,217,61,0.06);' : ''}">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="font-size:${idx === 0 ? '2.2rem' : '1.5rem'}; ${idx === 0 ? 'animation:pulse 1.5s infinite;' : ''}">${medals[idx] || "🎮"}</span>
+            <div>
+              <span style="font-weight:700; font-size:${idx === 0 ? '1.2rem' : '1rem'};">${p.name}</span>
+              ${p.name === state.myName.trim() ? '<span style="color:var(--dim); font-size:.8rem;"> (أنت)</span>' : ""}
+              ${idx === 0 ? '<div style="font-size:.75rem; color:var(--yellow); margin-top:2px;">👑 الفائز!</div>' : ""}
+            </div>
+          </div>
+          <div style="text-align:left;">
+            <div style="font-weight:900; font-size:${idx === 0 ? '1.8rem' : '1.3rem'}; color:var(--accent);">
+              ${p.totalScore}
+            </div>
+            <div style="font-size:.7rem; color:var(--dim);">نقطة</div>
+          </div>
+        </div>
+      </div>
+    `).join("")}
+
+    ${state.isHost ? `
+      <button id="btn-newgame" class="btn btn-green" style="margin-top:20px;">لعبة جديدة 🔄</button>
+    ` : `
+      <div class="center" style="padding:20px;">
+        <p style="color:var(--dim); font-size:.85rem;">GG! 🎉</p>
+      </div>
+    `}
+  `;
+
+  if (state.isHost) {
+    const btn = document.getElementById("btn-newgame");
+    if (btn) btn.addEventListener("click", async () => {
+      const code = state.roomCode;
+      const snap = await roomRef(code).child("players").once("value");
+      const players = snap.val() || {};
+      for (const name of Object.keys(players)) {
+        await roomRef(code).child("players/" + name).update({
+          totalScore: 0, answers: null, validation: null,
+          aiValidation: null, dupInfo: null, submitted: false, roundScore: 0,
+        });
+      }
+      await roomRef(code).update({ status: "lobby", round: 0, letter: "", finisher: "" });
+      state.screen = "lobby";
+      state.locked = false;
+      state.answers = {};
+      state.results = null;
+      state.hostOverrides = {};
+      state.scoresDirty = false;
+      render();
+    });
+  }
+}
+
 // ═══ Render ═══
 function render() {
   const app = document.getElementById("app");
@@ -765,6 +903,7 @@ function render() {
     case "lobby": renderLobby(app); break;
     case "playing": renderPlaying(app); break;
     case "results": renderResults(app); break;
+    case "gameover": renderGameOver(app); break;
   }
 }
 
@@ -849,6 +988,19 @@ function renderLobby(app) {
     </div>
 
     ${state.isHost ? `
+      <div class="card" style="padding:16px;">
+        <label style="font-size:.85rem; color:var(--dim); margin-bottom:10px; display:block;">عدد الجولات</label>
+        <div style="display:flex; gap:8px;">
+          ${[5,10,15].map(n => `
+            <button class="btn round-pick ${state.maxRounds === n ? 'btn-green' : ''}" data-rounds="${n}"
+              style="flex:1; padding:12px 0; font-size:1.1rem;
+              ${state.maxRounds !== n ? 'background:var(--glass); color:var(--dim); box-shadow:none; border:1px solid var(--border);' : ''}">
+              ${n}
+            </button>
+          `).join("")}
+        </div>
+      </div>
+
       <button id="btn-start" class="btn btn-green" ${players.length < 2 ? "disabled" : ""}>
         ${players.length < 2 ? "انتظر لاعب ثاني..." : "ابدأ اللعبة 🚀"}
       </button>
@@ -863,6 +1015,14 @@ function renderLobby(app) {
   if (state.isHost) {
     const btn = document.getElementById("btn-start");
     if (btn) btn.addEventListener("click", startGame);
+
+    document.querySelectorAll(".round-pick").forEach(b => {
+      b.addEventListener("click", () => {
+        state.maxRounds = parseInt(b.dataset.rounds);
+        roomRef(state.roomCode).update({ maxRounds: state.maxRounds });
+        render();
+      });
+    });
   }
 }
 
@@ -874,7 +1034,7 @@ function renderPlaying(app) {
   app.innerHTML = `
     <div class="center" style="margin:16px 0 20px;">
       <p style="color:var(--dim); font-size:.8rem; margin-bottom:8px;">
-        الجولة ${room.round || 1}
+        الجولة ${room.round || 1} من ${room.maxRounds || "∞"}
       </p>
       <div class="letter-box">${letter}</div>
       <p style="color:var(--accent); font-size:.85rem; font-weight:600; margin-top:8px;">الحرف: ${letter}</p>
@@ -968,8 +1128,9 @@ function renderResults(app) {
 
     ${sorted.map(([name, data], idx) => {
       const pOverrides = overrides[name] || data.validation;
-      const effectiveRound = calcRoundScore(name, data, pOverrides, room.finisher);
+      const effectiveRound = calcRoundScore(name, data, pOverrides, room.finisher, results);
       const effectiveTotal = (data.totalScore || 0) - (data.roundScore || 0) + effectiveRound;
+      const pDup = data.dupInfo || {};
 
       return `
       <div class="result-card ${idx === 0 ? 'first' : ''}" style="animation-delay:${idx * .1}s">
@@ -990,11 +1151,16 @@ function renderResults(app) {
         ${CATS.map(c => {
           const ans = (data.answers?.[c.key] || "").trim();
           const isValid = pOverrides[c.key];
-          const cls = !ans ? "answer-empty" : isValid ? "answer-correct" : "answer-wrong";
+          const dupStatus = pDup[c.key] || "";
+          const isDup = dupStatus === "duplicate";
+          const cls = !ans ? "answer-empty" : isValid ? (isDup ? "answer-correct" : "answer-correct") : "answer-wrong";
+          const pointsLabel = !ans ? "" : !isValid ? "0" : isDup ? "5" : "10";
           return `
-            <div class="answer-row ${cls}">
+            <div class="answer-row ${cls}" style="${isDup && isValid ? 'background:rgba(255,217,61,0.08);border-color:rgba(255,217,61,0.25);' : ''}">
               <span style="font-size:.9rem;">${c.icon}</span>
               <span style="flex:1; font-size:.9rem; color:${ans ? '#fff' : 'var(--dim)'};">${ans || "—"}</span>
+              ${isDup && isValid ? '<span style="font-size:.6rem; padding:2px 6px; border-radius:6px; background:rgba(255,217,61,0.15); color:var(--yellow);">مكرر</span>' : ""}
+              ${pointsLabel ? '<span style="font-size:.7rem; color:var(--dim); min-width:20px; text-align:center;">'+pointsLabel+'</span>' : ""}
               ${state.isHost && ans ? `
                 <button class="toggle-btn ${isValid ? 'toggle-correct' : 'toggle-wrong'}"
                   data-player="${name}" data-cat="${c.key}">
@@ -1015,14 +1181,20 @@ function renderResults(app) {
       </button>
     ` : ""}
 
-    ${state.isHost ? `
-      <button id="btn-next" class="btn btn-green" style="margin-top:4px;">جولة جديدة 🔄</button>
-    ` : `
-      <div class="center" style="padding:16px;">
-        <p style="color:var(--dim); font-size:.85rem;">بانتظار المدير يبدأ جولة جديدة...</p>
-        <div class="dots" style="margin-top:8px;"><span></span><span></span><span></span></div>
-      </div>
-    `}
+    ${(() => {
+      const isLastRound = room.round >= (room.maxRounds || 999);
+      if (state.isHost) {
+        if (isLastRound) {
+          return `<button id="btn-gameover" class="btn btn-yellow" style="margin-top:4px;">عرض النتائج النهائية 🏆</button>`;
+        }
+        return `<button id="btn-next" class="btn btn-green" style="margin-top:4px;">جولة جديدة (${room.round}/${room.maxRounds || "∞"}) 🔄</button>`;
+      } else {
+        if (isLastRound) {
+          return `<div class="center" style="padding:16px;"><p style="color:var(--yellow); font-size:.85rem;">آخر جولة! بانتظار المدير يعرض النتائج النهائية...</p><div class="dots" style="margin-top:8px;"><span></span><span></span><span></span></div></div>`;
+        }
+        return `<div class="center" style="padding:16px;"><p style="color:var(--dim); font-size:.85rem;">بانتظار المدير يبدأ جولة جديدة... (${room.round}/${room.maxRounds || "∞"})</p><div class="dots" style="margin-top:8px;"><span></span><span></span><span></span></div></div>`;
+      }
+    })()}
   `;
 
   // Host toggle listeners
@@ -1040,28 +1212,26 @@ function renderResults(app) {
 
     const nextBtn = document.getElementById("btn-next");
     if (nextBtn) nextBtn.addEventListener("click", nextRound);
+
+    const goBtn = document.getElementById("btn-gameover");
+    if (goBtn) goBtn.addEventListener("click", showGameOver);
   }
 }
 
-function calcRoundScore(name, data, validation, finisher) {
-  const answers = data.answers || {};
-  let correct = 0, wrong = 0;
-  CATS.forEach(c => {
-    const ans = (answers[c.key] || "").trim();
-    if (!ans) return;
-    if (validation[c.key]) correct++;
-    else wrong++;
-  });
-  let score = correct * 10;
-  if (name === finisher) {
-    if (wrong > 0) score -= (wrong * 5);
-    if (wrong === 0 && correct === 5) score += 5;
+function calcRoundScore(name, data, validation, finisher, allResults) {
+  // Recalculate with current overrides considering duplicates
+  if (!allResults) return data.roundScore || 0;
+  const allValidation = {};
+  const allAnswers = {};
+  for (const [pName, pData] of Object.entries(allResults)) {
+    allAnswers[pName] = pData.answers || {};
+    allValidation[pName] = (state.hostOverrides[pName]) || pData.validation;
   }
-  return score;
+  const dupInfo = findDuplicates(allValidation, allAnswers);
+  return calcScoreFromDuplicates(name, dupInfo, finisher);
 }
 
 function getEffectiveTotal(data, overrides, room) {
-  // Just for sorting
   return data.totalScore || 0;
 }
 
